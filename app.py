@@ -1187,4 +1187,4 @@ else:
         - Mean Reversion Trading
         """)
 
-unsafe_allow_html=True)
+# Footer
