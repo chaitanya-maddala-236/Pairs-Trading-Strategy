@@ -166,6 +166,20 @@ with st.sidebar:
     max_positions = st.slider("Max Concurrent Pairs", 1, 10, 3)
     
     st.markdown("---")
+    if st.button("🗑️ Clear Data Cache", help="Clear cache if experiencing errors"):
+        import shutil
+        import os
+        cache_dir = os.path.expanduser('~/.cache/py-yfinance')
+        if os.path.exists(cache_dir):
+            try:
+                shutil.rmtree(cache_dir)
+            except:
+                pass
+        st.cache_data.clear()
+        st.success("✅ Cache cleared!")
+        st.rerun()
+    
+    st.markdown("---")
     run_strategy = st.button("🚀 FIND PAIRS & BACKTEST", type="primary")
     
     if run_strategy:
@@ -196,14 +210,38 @@ SECTOR_STOCKS = {
 
 @st.cache_data(show_spinner=False)
 def download_data(tickers, start, end):
-    """Download stock price data"""
+    """Download stock data with improved error handling"""
+    import time
+    
     try:
-        data = yf.download(tickers, start=start, end=end, progress=False)['Adj Close']
+        # Try batch download first
+        data = yf.download(tickers, start=start, end=end, progress=False, threads=False)['Adj Close']
         if isinstance(data, pd.Series):
             data = data.to_frame(name=tickers[0])
         return data.dropna()
-    except Exception as e:
-        st.error(f"Error downloading data: {str(e)}")
+    except:
+        # Fallback: Download one by one
+        st.info("⏳ Using sequential download for reliability...")
+        all_data = {}
+        failed = []
+        
+        for ticker in tickers:
+            try:
+                ticker_data = yf.download(ticker, start=start, end=end, progress=False)
+                if 'Adj Close' in ticker_data.columns:
+                    all_data[ticker] = ticker_data['Adj Close']
+                time.sleep(0.1)
+            except:
+                failed.append(ticker)
+                continue
+        
+        if failed:
+            st.warning(f"⚠️ Failed to download: {', '.join(failed[:5])}")
+        
+        if all_data:
+            return pd.DataFrame(all_data).dropna()
+        
+        st.error("❌ Error downloading data")
         return None
 
 def find_cointegrated_pairs(data, significance=0.05):
@@ -1148,4 +1186,3 @@ else:
         - Statistical Arbitrage
         - Mean Reversion Trading
         """)
-
