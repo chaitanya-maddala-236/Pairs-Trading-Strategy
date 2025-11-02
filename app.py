@@ -82,7 +82,7 @@ with st.sidebar:
     min_cointegration = st.slider("Min Cointegration P-value", 0.01, 0.10, 0.05, 0.01)
     
     st.markdown("### 📅 Time Period")
-    lookback_years = st.slider("Lookback Period (years)", 1, 5, 3)
+    lookback_years = st.slider("Lookback Period (years)", 1, 5, 2)
     end_date = datetime.now()
     start_date = end_date - timedelta(days=lookback_years*365)
     
@@ -97,40 +97,47 @@ with st.sidebar:
     
     st.markdown("---")
     run_strategy = st.button("🚀 RUN STRATEGY", type="primary")
+    
+    st.markdown("---")
+    st.info("💡 **Recommended Settings:**\n- Lookback: 2 years\n- Entry Z: 2.0\n- Exit Z: 0.5")
 
 # Sector stock mappings
 SECTOR_STOCKS = {
-    "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "INTC", "CSCO", "ORCL", "CRM"],
-    "Financial": ["JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "USB"],
-    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "PXD", "MPC", "VLO", "PSX", "OXY"],
-    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "TMO", "MRK", "ABT", "DHR", "BMY", "LLY"],
-    "Consumer": ["AMZN", "TSLA", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW", "TJX", "DG"]
+    "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "INTC", "CSCO"],
+    "Financial": ["JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW"],
+    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "VLO", "PSX"],
+    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "LLY", "MRK", "ABT", "TMO"],
+    "Consumer": ["AMZN", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW", "WMT"]
 }
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_data(tickers, start, end):
     """Download stock data with robust error handling"""
     all_data = {}
-    successful = []
-    failed = []
     
     for ticker in tickers:
         try:
+            # Download using Ticker object
             stock = yf.Ticker(ticker)
-            hist = stock.history(start=start, end=end, auto_adjust=True)
+            hist = stock.history(start=start, end=end)
             
+            # Check if we have valid data
             if not hist.empty and len(hist) > 50:
-                all_data[ticker] = hist['Close']
-                successful.append(ticker)
-        except Exception as e:
-            failed.append(ticker)
+                # Use Close price
+                if 'Close' in hist.columns:
+                    all_data[ticker] = hist['Close']
+        except:
             continue
     
-    if all_data:
-        df = pd.DataFrame(all_data).dropna()
-        return df if len(df) > 50 else None
+    if not all_data:
+        return None
     
-    return None
+    # Create DataFrame and drop NaN
+    df = pd.DataFrame(all_data)
+    df = df.dropna()
+    
+    # Return only if we have sufficient data
+    return df if len(df) > 50 else None
 
 def find_cointegrated_pairs(data, significance=0.05):
     """Find cointegrated pairs using Engle-Granger test"""
@@ -138,19 +145,22 @@ def find_cointegrated_pairs(data, significance=0.05):
     pairs = []
     pvalue_matrix = np.ones((n, n))
     
-    columns = data.columns
+    columns = data.columns.tolist()
+    
     for i in range(n):
         for j in range(i+1, n):
-            stock1 = data[columns[i]]
-            stock2 = data[columns[j]]
-            
             try:
+                stock1 = data.iloc[:, i].values
+                stock2 = data.iloc[:, j].values
+                
+                # Test cointegration
                 result = coint(stock1, stock2)
                 pvalue = result[1]
                 pvalue_matrix[i, j] = pvalue
                 
                 if pvalue < significance:
-                    correlation = stock1.corr(stock2)
+                    # Calculate correlation
+                    correlation = np.corrcoef(stock1, stock2)[0, 1]
                     
                     pairs.append({
                         'stock1': columns[i],
@@ -165,9 +175,16 @@ def find_cointegrated_pairs(data, significance=0.05):
 
 def calculate_spread(stock1_prices, stock2_prices):
     """Calculate spread using linear regression"""
-    slope, intercept, r_value, p_value, std_err = stats.linregress(stock2_prices, stock1_prices)
-    spread = stock1_prices - (slope * stock2_prices + intercept)
-    zscore = (spread - spread.mean()) / spread.std()
+    stock1 = stock1_prices.values if hasattr(stock1_prices, 'values') else stock1_prices
+    stock2 = stock2_prices.values if hasattr(stock2_prices, 'values') else stock2_prices
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(stock2, stock1)
+    spread = stock1 - (slope * stock2 + intercept)
+    
+    # Calculate z-score
+    spread_mean = np.mean(spread)
+    spread_std = np.std(spread)
+    zscore = (spread - spread_mean) / spread_std
     
     return spread, zscore, slope, intercept
 
@@ -178,30 +195,31 @@ def backtest_pair(data, stock1, stock2, entry_z, exit_z, stop_z):
     
     spread, zscore, hedge_ratio, intercept = calculate_spread(stock1_prices, stock2_prices)
     
-    positions = pd.Series(0, index=data.index)
+    # Convert to series with index
+    zscore_series = pd.Series(zscore, index=data.index)
+    spread_series = pd.Series(spread, index=data.index)
+    
     trades = []
     
     in_position = False
     entry_date = None
-    entry_zscore = None
+    entry_zscore_val = None
     position_type = None
     
     for i in range(1, len(zscore)):
-        date = zscore.index[i]
-        z = zscore.iloc[i]
+        date = data.index[i]
+        z = zscore[i]
         
         if not in_position:
             if z > entry_z:
-                positions.iloc[i] = -1
                 in_position = True
                 entry_date = date
-                entry_zscore = z
+                entry_zscore_val = z
                 position_type = 'short_spread'
             elif z < -entry_z:
-                positions.iloc[i] = 1
                 in_position = True
                 entry_date = date
-                entry_zscore = z
+                entry_zscore_val = z
                 position_type = 'long_spread'
         else:
             should_exit = False
@@ -224,14 +242,14 @@ def backtest_pair(data, stock1, stock2, entry_z, exit_z, stop_z):
             
             if should_exit:
                 if position_type == 'short_spread':
-                    pnl = (entry_zscore - z) * spread.std()
+                    pnl = (entry_zscore_val - z) * np.std(spread)
                 else:
-                    pnl = (z - entry_zscore) * spread.std()
+                    pnl = (z - entry_zscore_val) * np.std(spread)
                 
                 trades.append({
                     'entry_date': entry_date,
                     'exit_date': date,
-                    'entry_zscore': entry_zscore,
+                    'entry_zscore': entry_zscore_val,
                     'exit_zscore': z,
                     'position_type': position_type,
                     'pnl': pnl,
@@ -239,10 +257,9 @@ def backtest_pair(data, stock1, stock2, entry_z, exit_z, stop_z):
                     'days_held': (date - entry_date).days
                 })
                 
-                positions.iloc[i] = 0
                 in_position = False
     
-    return positions, trades, zscore, spread, hedge_ratio
+    return trades, zscore_series, spread_series, hedge_ratio
 
 def calculate_strategy_metrics(trades, capital):
     """Calculate strategy performance metrics"""
@@ -280,15 +297,17 @@ def calculate_strategy_metrics(trades, capital):
 
 # Main execution
 if run_strategy:
-    with st.spinner('🔄 Analyzing pairs...'):
+    with st.spinner('🔄 Downloading data and analyzing pairs...'):
         tickers = SECTOR_STOCKS[sector]
         
         # Download data
         data = download_data(tickers, start_date, end_date)
         
-        if data is None or len(data) < 50:
-            st.error("❌ Unable to download sufficient data. Try different settings.")
+        if data is None:
+            st.error("❌ Unable to download data. Please try again or adjust settings.")
             st.stop()
+        
+        st.info(f"✅ Downloaded {len(data.columns)} stocks with {len(data)} days of data")
         
         # Find pairs
         pairs, pvalue_matrix = find_cointegrated_pairs(data, min_cointegration)
@@ -303,31 +322,34 @@ if run_strategy:
         # Backtest each pair
         pair_results = []
         for pair in pairs:
-            positions, trades, zscore, spread, hedge_ratio = backtest_pair(
-                data, pair['stock1'], pair['stock2'],
-                entry_zscore, exit_zscore, stop_loss
-            )
-            
-            metrics = calculate_strategy_metrics(trades, capital)
-            
-            if metrics:
-                pair_results.append({
-                    'pair': pair,
-                    'trades': trades,
-                    'metrics': metrics,
-                    'zscore': zscore,
-                    'spread': spread,
-                    'hedge_ratio': hedge_ratio
-                })
+            try:
+                trades, zscore, spread, hedge_ratio = backtest_pair(
+                    data, pair['stock1'], pair['stock2'],
+                    entry_zscore, exit_zscore, stop_loss
+                )
+                
+                metrics = calculate_strategy_metrics(trades, capital)
+                
+                if metrics and metrics['total_trades'] > 0:
+                    pair_results.append({
+                        'pair': pair,
+                        'trades': trades,
+                        'metrics': metrics,
+                        'zscore': zscore,
+                        'spread': spread,
+                        'hedge_ratio': hedge_ratio
+                    })
+            except Exception as e:
+                continue
         
         if not pair_results:
-            st.warning("⚠️ No profitable pairs found. Try adjusting parameters.")
+            st.warning("⚠️ No tradeable pairs found. Try adjusting parameters (lower entry z-score or longer time period).")
             st.stop()
         
         # Sort by total return
         pair_results = sorted(pair_results, key=lambda x: x['metrics']['total_return'], reverse=True)
     
-    st.success(f"✅ Analysis Complete! Found {len(pair_results)} tradeable pairs")
+    st.success(f"🎉 Analysis Complete! Found {len(pair_results)} tradeable pairs")
     
     # RESULTS SECTION
     st.markdown("## 📊 Portfolio Overview")
@@ -546,8 +568,8 @@ if run_strategy:
     
     fig = go.Figure(data=go.Heatmap(
         z=pvalue_matrix,
-        x=data.columns,
-        y=data.columns,
+        x=data.columns.tolist(),
+        y=data.columns.tolist(),
         colorscale='RdYlGn_r',
         reversescale=False,
         zmin=0,
@@ -564,6 +586,42 @@ if run_strategy:
 else:
     # Landing page
     st.info("👋 Configure your parameters in the sidebar and click **RUN STRATEGY** to start!")
+    
+    st.markdown("### 🎯 Quick Test Cases")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("""
+        **Test Case 1: Conservative**
+        - Sector: Technology
+        - Lookback: 2 years
+        - Entry Z: 2.0
+        - Exit Z: 0.5
+        - Stop Loss: 3.5
+        """)
+    
+    with col2:
+        st.markdown("""
+        **Test Case 2: Aggressive**
+        - Sector: Financial
+        - Lookback: 1 year
+        - Entry Z: 1.5
+        - Exit Z: 0.3
+        - Stop Loss: 3.0
+        """)
+    
+    with col3:
+        st.markdown("""
+        **Test Case 3: Long-term**
+        - Sector: Healthcare
+        - Lookback: 3 years
+        - Entry Z: 2.5
+        - Exit Z: 0.7
+        - Stop Loss: 4.0
+        """)
+    
+    st.markdown("---")
     
     col1, col2, col3 = st.columns(3)
     
